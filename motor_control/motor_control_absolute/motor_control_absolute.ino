@@ -1,52 +1,61 @@
-#include <ArduinoHardware.h>
-#include <ArduinoTcpHardware.h>
-#include <ros.h>
+// motor_control_absolute.ino
+//
+// ROS 2-era firmware for the micro-manipulator Arduino.
+//
+// This sketch deliberately uses NOTHING from ROS. rosserial (the <ros.h> /
+// ArduinoHardware library used by the old motor_control_ros sketch) only exists
+// for ROS 1 and was removed when the project moved to ROS 2 Jazzy. Instead, the
+// Arduino now speaks a tiny plain-text serial protocol, and a ROS 2 node on the
+// PC (see ../../ros2_bridge/serial_bridge.py) translates between that protocol
+// and the ROS 2 topics. The board therefore does not care which ROS version the
+// PC runs and works on any Arduino (AVR Uno/Mega/Nano included).
+//
+// ---------------------------------------------------------------------------
+// Serial protocol (9600 baud, newline-terminated)
+//
+//   Every message is exactly 12 ASCII digits + '\n', four zero-padded 3-digit
+//   servo angles in this fixed order (matching motor_angles_msg/MotorAngles):
+//
+//       [0:3] proximal_pan   [3:6] proximal_tilt   [6:9] distal_pan   [9:12] distal_tilt
+//
+//   Startup handshake:
+//     1. On boot the Arduino moves every servo to its equilibrium angle and
+//        repeatedly prints the 12-digit equilibrium string.
+//     2. The PC side replies with "OK\n" once it has read a valid string.
+//   Steady state:
+//     - PC -> Arduino: a 12-digit command = the desired absolute angles.
+//     - Arduino moves the servos (clamped to each servo's limits) and replies
+//       with a 12-digit string of the actual resulting angles.
+// ---------------------------------------------------------------------------
 
 #include "include/LimitServo.hpp"
 
 const int BAUD_RATE = 9600;
 const int MOTOR_STATE_STRING_LENGTH = 12;
 
-const int servoDistalPanPin = 7;
+// Servo signal pins
+const int servoDistalTiltPin = 7;
 const int servoDistalPanPin = 8;
 const int servoProximalPanPin = 9;
 const int servoProximalTiltPin = 10;
 
+// Equilibrium (rest) angles
 const int servoDistalTiltEqAngle = 88;
 const int servoDistalPanEqAngle = 84;
 const int servoProximalPanEqAngle = 95;
 const int servoProximalTiltEqAngle = 90;
 
+// Lower angular limits
 const int servoDistalTiltMinAngle = 80;
 const int servoDistalPanMinAngle = 78;
 const int servoProximalPanMinAngle = 89;
 const int servoProximalTiltMinAngle = 84;
 
+// Upper angular limits
 const int servoDistalTiltMaxAngle = 94;
 const int servoDistalPanMaxAngle = 100;
 const int servoProximalPanMaxAngle = 100;
 const int servoProximalTiltMaxAngle = 95;
-
-int servoUpDownPos = servoDistalTiltEqAngle;
-int servoLeftRightPos = servoDistalPanEqAngle;
-int servoProximalPanPos = servoProximalPanEqAngle;
-int servoProximalTiltPos = servoProximalTiltEqAngle;
-
-char* motorStateString;
-
-LimitServo servoDistalTilt(
-    servoDistalPanPin,
-    servoDistalTiltEqAngle,
-    servoDistalTiltMinAngle,
-    servoDistalTiltMaxAngle
-);
-
-LimitServo servoDistalPan(
-    servoDistalPanPin,
-    servoDistalPanEqAngle,
-    servoDistalPanMinAngle,
-    servoDistalPanMaxAngle
-);
 
 LimitServo servoProximalPan(
     servoProximalPanPin,
@@ -62,74 +71,81 @@ LimitServo servoProximalTilt(
     servoProximalTiltMaxAngle
 );
 
+LimitServo servoDistalPan(
+    servoDistalPanPin,
+    servoDistalPanEqAngle,
+    servoDistalPanMinAngle,
+    servoDistalPanMaxAngle
+);
+
+LimitServo servoDistalTilt(
+    servoDistalTiltPin,
+    servoDistalTiltEqAngle,
+    servoDistalTiltMinAngle,
+    servoDistalTiltMaxAngle
+);
+
+char motorStateString[MOTOR_STATE_STRING_LENGTH + 2];  // 12 digits + '\n' + '\0'
+
+// Fill motorStateString with the current servo angles in protocol order.
+void WriteMotorStateString()
+{
+    sprintf(
+        motorStateString,
+        "%03d%03d%03d%03d\n",
+        servoProximalPan.GetAngle(),
+        servoProximalTilt.GetAngle(),
+        servoDistalPan.GetAngle(),
+        servoDistalTilt.GetAngle()
+    );
+}
+
 void setup()
 {
     Serial.begin(BAUD_RATE);
 
-    servoDistalTilt.Attach();
-    servoDistalPan.Attach();
     servoProximalPan.Attach();
     servoProximalTilt.Attach();
+    servoDistalPan.Attach();
+    servoDistalTilt.Attach();
 
-    servoDistalTilt.MoveToEquilibrium();
-    servoDistalPan.MoveToEquilibrium();
     servoProximalPan.MoveToEquilibrium();
     servoProximalTilt.MoveToEquilibrium();
-
-    bool hasSentStartupString = false;
-    motorStateString = (char *)malloc(MOTOR_STATE_STRING_LENGTH * sizeof(char));
-
-    int servoUpDownEqAngle = servoDistalTilt.GetEquilibriumAngle();
-    int servoLeftRightEqAngle = servoDistalPan.GetEquilibriumAngle();
-    int servoProximalPanEqAngle = servoProximalPan.GetEquilibriumAngle();
-    int servoProximalTiltEqAngle = servoProximalTilt.GetEquilibriumAngle();
-
-    sprintf(motorStateString, "%03d%03d%03d%03d\n", servoUpDownEqAngle, servoLeftRightEqAngle, servoProximalPanEqAngle, servoProximalTiltEqAngle);
+    servoDistalPan.MoveToEquilibrium();
+    servoDistalTilt.MoveToEquilibrium();
 
     while (!Serial)
     {
     }
 
-    while (!hasSentStartupString)
+    // Report equilibrium angles until the PC side acknowledges with "OK".
+    bool hasCompletedHandshake = false;
+
+    while (!hasCompletedHandshake)
     {
+        WriteMotorStateString();
         Serial.print(motorStateString);
 
         String response = Serial.readStringUntil('\n');
-        hasSentStartupString = (response == "OK");
+        hasCompletedHandshake = (response == "OK");
     }
-
-    memset(motorStateString, 0, MOTOR_STATE_STRING_LENGTH * sizeof(char));
 }
 
-void loop() {
+void loop()
+{
     while (Serial.available())
     {
         String commandString = Serial.readStringUntil('\n');
 
-        // Serial.print("Received command: ");
-        // Serial.print(commandString);
-        // Serial.print(", Length: ");
-        // Serial.println(commandString.length());
-
-        if (commandString.length() == 12)
+        if (commandString.length() == MOTOR_STATE_STRING_LENGTH)
         {
-            // Serial.print("Moving motor 1 to: ");
-            // Serial.println(state.substring(0,3));
-            servoDistalTilt.Move(commandString.substring(0,3).toInt());
+            servoProximalPan.Move(commandString.substring(0, 3).toInt());
+            servoProximalTilt.Move(commandString.substring(3, 6).toInt());
+            servoDistalPan.Move(commandString.substring(6, 9).toInt());
+            servoDistalTilt.Move(commandString.substring(9, 12).toInt());
 
-            // Serial.print("Moving motor 2 to: ");
-            // Serial.println(state.substring(3,6));
-            servoDistalPan.Move(commandString.substring(3,6).toInt());
-
-            // Serial.print("Moving motor 3 to: ");
-            // Serial.println(state.substring(6,9));
-            servoProximalPan.Move(commandString.substring(6,9).toInt());
-
-            // Serial.print("Moving motor 4 to: ");
-            // Serial.println(state.substring(9,12));
-            servoProximalTilt.Move(commandString.substring(9,12).toInt());
-
-            sprintf(motorStateString, "%03d%03d%03d%03d\n", servoDistalTilt.GetAngle(), servoDistalPan.GetAngle(), servoProximalPan.GetAngle(), servoProximalTilt.GetAngle());
+            // Echo back the angles the servos actually hold (post-clamp).
+            WriteMotorStateString();
             Serial.print(motorStateString);
         }
     }
