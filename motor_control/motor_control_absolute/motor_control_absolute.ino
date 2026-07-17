@@ -144,7 +144,6 @@ void loop()
             servoDistalPan.Move(commandString.substring(6, 9).toInt());
             servoDistalTilt.Move(commandString.substring(9, 12).toInt());
 
-            // Echo back the angles the servos actually hold (post-clamp).
             WriteMotorStateString();
             Serial.print(motorStateString);
         }

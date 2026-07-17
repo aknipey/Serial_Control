@@ -28,6 +28,8 @@ package -- it is a standalone rclpy script.
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+
 
 import serial  # pip install pyserial
 
@@ -84,8 +86,14 @@ class SerialBridge(Node):
         # timeout: blocking reads give up after 1 s so the node stays responsive.
         self.serial = serial.Serial(port, baud, timeout=1.0)
 
+
+        state_qos = QoSProfile(depth=1)
+        state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
         self.state_pub = self.create_publisher(
-            MotorAngles, "micro_module_motor_states", 1
+            MotorAngles,
+            "micro_module_motor_states",
+            state_qos
         )
         self.min_pub = self.create_publisher(
             MotorAngles, "micro_module_motor_min_angles", 1
@@ -103,6 +111,19 @@ class SerialBridge(Node):
         # Re-publish the (static) limits at 1 Hz so a late-joining control node
         # is guaranteed to receive them regardless of startup ordering.
         self.create_timer(1.0, self._publish_limits)
+        self.create_timer(0.02, self.read_serial_state)
+
+    def read_serial_state(self):
+        while self.serial.in_waiting:
+            line = self.serial.readline().decode("ascii", errors="ignore")
+
+            self.get_logger().info(f"Serial received: {line!r}")
+
+            state = parse_state_string(line)
+
+            if state is not None:
+                self.get_logger().info(f"Parsed state: {state}")
+                self.state_pub.publish(make_motor_angles(*state))
 
     def _do_startup_handshake(self):
         """Read the Arduino's equilibrium string, then acknowledge with 'OK'."""
@@ -110,6 +131,8 @@ class SerialBridge(Node):
         state = None
         while rclpy.ok() and state is None:
             line = self.serial.readline().decode("ascii", errors="ignore")
+
+            self.get_logger().info(f"Arduino returned: {line}")
             state = parse_state_string(line)
 
         self.serial.write(b"OK\n")
@@ -122,21 +145,16 @@ class SerialBridge(Node):
         self.max_pub.publish(make_motor_angles(*MAX_ANGLES))
 
     def command_callback(self, msg):
+
         command = angles_to_command(
             msg.proximal_pan_angle,
             msg.proximal_tilt_angle,
             msg.distal_pan_angle,
             msg.distal_tilt_angle,
         )
-        self.serial.write(command.encode("ascii"))
 
-        # The firmware echoes the resulting angles after every command.
-        line = self.serial.readline().decode("ascii", errors="ignore")
-        state = parse_state_string(line)
-        if state is not None:
-            self.state_pub.publish(make_motor_angles(*state))
-        else:
-            self.get_logger().warn(f"Ignoring malformed state reply: {line!r}")
+        self.get_logger().info(f"Sending: {command!r}")
+        self.serial.write(command.encode("ascii"))
 
 
 def main(args=None):
