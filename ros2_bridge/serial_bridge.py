@@ -26,6 +26,8 @@ Run it with:
 package -- it is a standalone rclpy script.
 """
 
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -42,6 +44,12 @@ MIN_ANGLES = (89, 84, 78, 80)
 MAX_ANGLES = (100, 95, 100, 94)
 
 STRING_LENGTH = 12  # four zero-padded 3-digit angles
+
+# Seconds the Mega's bootloader takes after the port opens (it resets on open)
+ARDUINO_RESET_TIME = 2.0
+# A state arriving this long (s) after the last command was not a reply to it, so the
+# Arduino is still in (or back in) its startup handshake. Replies take ~15-30 ms.
+UNSOLICITED_STATE_TIME = 0.5
 
 
 def angles_to_command(pp, pt, dp, dt):
@@ -85,6 +93,16 @@ class SerialBridge(Node):
         self.get_logger().info(f"Opening serial port {port} at {baud} baud...")
         # timeout: blocking reads give up after 1 s so the node stays responsive.
         self.serial = serial.Serial(port, baud, timeout=1.0)
+        # Opening the port resets the Arduino (DTR). Wait out its bootloader, then drop
+        # whatever was buffered before the reset: answering a stale startup string
+        # sends "OK" while the board is still rebooting, it is lost, and the
+        # firmware then waits for "OK" forever.
+        time.sleep(ARDUINO_RESET_TIME)
+        self.serial.reset_input_buffer()
+
+        self.last_state = None          # newest (pp, pt, dp, dt) from the Arduino
+        self.last_command_time = 0.0    # time.monotonic() of the last command sent
+        self.last_ok_time = 0.0
 
 
         state_qos = QoSProfile(depth=1)
@@ -108,9 +126,12 @@ class SerialBridge(Node):
 
         self._do_startup_handshake()
 
-        # Re-publish the (static) limits at 1 Hz so a late-joining control node
-        # is guaranteed to receive them regardless of startup ordering.
-        self.create_timer(1.0, self._publish_limits)
+        # Re-publish the (static) limits and the last state at 1 Hz so a late-joining
+        # control node is guaranteed to receive them regardless of startup ordering.
+        # After the handshake the Arduino only reports in reply to a command, and
+        # micro_module_control sends nothing until it has a state: without this a
+        # node started after the handshake waits forever.
+        self.create_timer(1.0, self._republish)
         self.create_timer(0.02, self.read_serial_state)
 
     def read_serial_state(self):
@@ -123,7 +144,19 @@ class SerialBridge(Node):
 
             if state is not None:
                 self.get_logger().info(f"Parsed state: {state}")
+                self.last_state = state
                 self.state_pub.publish(make_motor_angles(*state))
+                self._check_still_in_handshake()
+
+    def _check_still_in_handshake(self):
+        """After the handshake the Arduino only speaks in reply to a command. A state
+        with no command just sent is its startup string again (our "OK" was lost, or
+        it reset): acknowledge it again so it leaves the handshake loop."""
+        now = time.monotonic()
+        if now - self.last_command_time > UNSOLICITED_STATE_TIME and now - self.last_ok_time > 0.5:
+            self.serial.write(b"OK\n")
+            self.last_ok_time = now
+            self.get_logger().warn("Arduino is still sending its startup string - re-sent OK")
 
     def _do_startup_handshake(self):
         """Read the Arduino's equilibrium string, then acknowledge with 'OK'."""
@@ -136,6 +169,8 @@ class SerialBridge(Node):
             state = parse_state_string(line)
 
         self.serial.write(b"OK\n")
+        self.last_ok_time = time.monotonic()
+        self.last_state = state
         self.get_logger().info(f"Handshake complete. Equilibrium angles: {state}")
         self.state_pub.publish(make_motor_angles(*state))
         self._publish_limits()
@@ -143,6 +178,11 @@ class SerialBridge(Node):
     def _publish_limits(self):
         self.min_pub.publish(make_motor_angles(*MIN_ANGLES))
         self.max_pub.publish(make_motor_angles(*MAX_ANGLES))
+
+    def _republish(self):
+        self._publish_limits()
+        if self.last_state is not None:
+            self.state_pub.publish(make_motor_angles(*self.last_state))
 
     def command_callback(self, msg):
 
@@ -155,6 +195,7 @@ class SerialBridge(Node):
 
         self.get_logger().info(f"Sending: {command!r}")
         self.serial.write(command.encode("ascii"))
+        self.last_command_time = time.monotonic()
 
 
 def main(args=None):
